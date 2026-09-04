@@ -5353,6 +5353,11 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
             }
         }
 
+        // Shift+Insert pastes the primary selection, matching middle-click.
+        if (action == .press and event.key == .insert and event.mods.shift and
+            !event.mods.ctrl and !event.mods.alt and !event.mods.super)
+            return self.beginPaste(.primary);
+
         // Copy/paste bindings take priority over the application.
         if (action == .press and event.mods.ctrl and event.mods.shift) {
             switch (event.unshifted_codepoint) {
