@@ -286,6 +286,7 @@ not yet supported. Search mode retains its own controls.
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
+| `Shift+Insert` | Paste the primary selection |
 | `Ctrl+Shift+F` | Search scrollback |
 | `Ctrl+Shift+N` | Open a new window in the current directory |
 | `Ctrl+Shift+,` | Reload configuration |
@@ -308,7 +309,7 @@ Scrollback keybindings pass through to applications using the alternate screen.
 
 Hold `Shift` while dragging to select text after an application captures the
 mouse. Hold `Ctrl+Shift` instead of `Ctrl` to open or copy a link in this
-state. Middle-click to paste the primary selection.
+state. Middle-click or press `Shift+Insert` to paste the primary selection.
 
 While `Ctrl` is held over a link, its target shows in the bottom-left corner.
 An OSC 8 hyperlink's text can differ from its target, so monstar asks before
