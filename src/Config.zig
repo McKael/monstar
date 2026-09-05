@@ -147,7 +147,9 @@ pub const LinuxCgroup = enum { never, always };
 /// and live as long as it does.
 pub fn load(arena: std.mem.Allocator, environ: std.process.Environ) Config {
     const path = path: {
-        if (environ.getPosix("XDG_CONFIG_HOME")) |base| {
+        // XDG base directories must be absolute; empty values use defaults.
+        const base = environ.getPosix("XDG_CONFIG_HOME") orelse "";
+        if (std.fs.path.isAbsolute(base)) {
             break :path std.fmt.allocPrintSentinel(arena, "{s}/monstar/config", .{base}, 0) catch return .{};
         }
         if (environ.getPosix("HOME")) |home| {
@@ -966,4 +968,60 @@ test "absolute theme file resolves" {
     const colors = config.terminalColors(.dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, colors.background.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xab, .g = 0xcd, .b = 0xef }, colors.palette.current[15]);
+}
+
+test "config and named themes ignore empty and relative XDG_CONFIG_HOME" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const locations = [_][]const u8{ "home/.config", "xdg" };
+    const names = [_][]const u8{ "fallback", "override" };
+    const colors = [_][]const u8{ "123456", "abcdef" };
+    for (locations, names, colors) |location, name, color| {
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/monstar/themes", .{location}));
+        try tmp.dir.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "{s}/monstar/config", .{location}),
+            .data = try std.fmt.allocPrint(arena, "app-id = {s}\ntheme = xdg-path-regression\n", .{name}),
+        });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "{s}/monstar/themes/xdg-path-regression", .{location}),
+            .data = try std.fmt.allocPrint(arena, "background = #{s}\n", .{color}),
+        });
+    }
+
+    const home = try tmp.dir.realPathFileAlloc(io, "home", arena);
+    const xdg = try tmp.dir.realPathFileAlloc(io, "xdg", arena);
+    var cwd_dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer cwd_dir.close(io);
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = cwd_buf[0..try cwd_dir.realPath(io, &cwd_buf)];
+    // This relative path really contains a config and theme: ignoring it
+    // must not depend on the files being absent.
+    const relative = try std.fs.path.relativePosix(arena, cwd, cwd, xdg);
+    const home_entry = try std.fmt.allocPrintSentinel(arena, "HOME={s}", .{home}, 0);
+    const cases = [_]struct { xdg: ?[]const u8, location: usize }{
+        .{ .xdg = null, .location = 0 },
+        .{ .xdg = xdg, .location = 1 },
+        .{ .xdg = "", .location = 0 },
+        .{ .xdg = relative, .location = 0 },
+    };
+    for (cases) |case| {
+        const environ: std.process.Environ = .{ .block = .{ .slice = if (case.xdg) |value|
+            &.{ home_entry.ptr, (try std.fmt.allocPrintSentinel(arena, "XDG_CONFIG_HOME={s}", .{value}, 0)).ptr }
+        else
+            &.{home_entry.ptr} } };
+        var config = load(arena, environ);
+        try std.testing.expectEqualStrings(names[case.location], config.app_id);
+        try config.resolveThemes(io, arena, environ);
+        for ([_]vt.device_status.ColorScheme{ .light, .dark }) |scheme| {
+            try std.testing.expectEqual(
+                try config_theme.parseColor(colors[case.location]),
+                config.terminalColors(scheme).background.get().?,
+            );
+        }
+    }
 }

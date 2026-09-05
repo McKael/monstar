@@ -224,7 +224,8 @@ pub fn loadOverrides(
         return null;
     }
 
-    if (environ.getPosix("XDG_CONFIG_HOME")) |base| {
+    const base = environ.getPosix("XDG_CONFIG_HOME") orelse "";
+    if (std.fs.path.isAbsolute(base)) {
         const path = try std.fs.path.joinZ(arena, &.{ base, "monstar", "themes", name });
         if (readFile(arena, path)) |text| return parseOverrides(text);
     } else if (environ.getPosix("HOME")) |home| {
