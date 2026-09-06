@@ -527,6 +527,9 @@ fn takeReply(self: *Connection, serial: u32) ?Message {
 }
 
 fn authenticate(self: *Connection) !void {
+    // Bound the entire handshake, including partial lines and blocked writes,
+    // so an unresponsive bus cannot prevent the terminal from starting.
+    const deadline = std.Io.Clock.awake.now(self.io).addDuration(.fromMilliseconds(1000));
     var uid_buffer: [32]u8 = undefined;
     const uid = try std.fmt.bufPrint(&uid_buffer, "{d}", .{linux.getuid()});
     var auth_buffer: [2 * uid_buffer.len + 32]u8 = undefined;
@@ -535,20 +538,20 @@ fn authenticate(self: *Connection) !void {
     try stream.writeAll("AUTH EXTERNAL ");
     for (uid) |byte| try stream.print("{x:0>2}", .{byte});
     try stream.writeAll("\r\n");
-    try writeBlocking(self.fd, stream.buffered());
+    try self.writeAuth(stream.buffered(), deadline);
 
     var line_buffer: [auth_line_max]u8 = undefined;
-    const response = try readAuthLine(self.fd, &line_buffer);
+    const response = try self.readAuthLine(&line_buffer, deadline);
     if (!std.mem.startsWith(u8, response, "OK ")) return error.AuthenticationFailed;
 
-    try writeBlocking(self.fd, "NEGOTIATE_UNIX_FD\r\n");
-    const negotiation = try readAuthLine(self.fd, &line_buffer);
+    try self.writeAuth("NEGOTIATE_UNIX_FD\r\n", deadline);
+    const negotiation = try self.readAuthLine(&line_buffer, deadline);
     if (std.mem.eql(u8, negotiation, "AGREE_UNIX_FD")) {
         self.unix_fd_enabled = true;
     } else if (!std.mem.startsWith(u8, negotiation, "ERROR")) {
         return error.AuthenticationFailed;
     }
-    try writeBlocking(self.fd, "BEGIN\r\n");
+    try self.writeAuth("BEGIN\r\n", deadline);
 }
 
 fn setNonblocking(self: *Connection) !void {
@@ -603,26 +606,49 @@ fn unescapeAddress(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return allocator.realloc(output, output_index);
 }
 
-fn writeBlocking(fd: posix.fd_t, data: []const u8) !void {
+fn waitAuth(self: *Connection, events: i16, deadline: std.Io.Timestamp) !void {
+    while (true) {
+        const remaining_ns = std.Io.Clock.awake.now(self.io).durationTo(deadline).nanoseconds;
+        if (remaining_ns <= 0) return error.Timeout;
+        const remaining_ms: i32 = @intCast(@divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
+        // Recompute the remaining time after EINTR instead of restarting the
+        // full poll timeout. Read/write classify EOF and socket errors.
+        const rc = linux.poll(&fds, fds.len, remaining_ms);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.Timeout;
+                if (fds[0].revents & posix.POLL.NVAL != 0) return error.ConnectionClosed;
+                return;
+            },
+            .INTR => continue,
+            else => return error.AuthenticationFailed,
+        }
+    }
+}
+
+fn writeAuth(self: *Connection, data: []const u8, deadline: std.Io.Timestamp) !void {
     var offset: usize = 0;
     while (offset < data.len) {
-        const rc = linux.write(fd, data[offset..].ptr, data.len - offset);
+        try self.waitAuth(posix.POLL.OUT, deadline);
+        const rc = linux.sendto(self.fd, data[offset..].ptr, data.len - offset, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return error.ConnectionClosed;
                 offset += rc;
             },
-            .INTR => continue,
+            .INTR, .AGAIN => continue,
             .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionClosed,
             else => return error.WriteFailed,
         }
     }
 }
 
-fn readAuthLine(fd: posix.fd_t, buffer: []u8) ![]const u8 {
+fn readAuthLine(self: *Connection, buffer: []u8, deadline: std.Io.Timestamp) ![]const u8 {
     var length: usize = 0;
     while (length < buffer.len) {
-        const rc = linux.read(fd, buffer[length..].ptr, 1);
+        try self.waitAuth(posix.POLL.IN, deadline);
+        const rc = linux.recvfrom(self.fd, buffer[length..].ptr, 1, linux.MSG.DONTWAIT, null, null);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return error.ConnectionClosed;
@@ -630,7 +656,7 @@ fn readAuthLine(fd: posix.fd_t, buffer: []u8) ![]const u8 {
                 if (length >= 2 and buffer[length - 2] == '\r' and buffer[length - 1] == '\n')
                     return buffer[0 .. length - 2];
             },
-            .INTR => continue,
+            .INTR, .AGAIN => continue,
             .CONNRESET, .NOTCONN => return error.ConnectionClosed,
             else => return error.AuthenticationFailed,
         }
@@ -659,6 +685,68 @@ fn testSocketConnection(allocator: std.mem.Allocator) !struct { Connection, posi
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0, &sockets);
     if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
     return .{ .{ .allocator = allocator, .io = std.testing.io, .fd = sockets[0], .unix_fd_enabled = true }, sockets[1] };
+}
+
+test "authentication times out for silent and stalled peers" {
+    for ([_][]const u8{ "", "OK partial", "OK bus\r\n" }) |reply| {
+        const pair = try testSocketConnection(std.testing.allocator);
+        var connection = pair[0];
+        defer connection.deinit();
+        defer _ = linux.close(pair[1]);
+        // Session sockets are still blocking during authentication. Cover no
+        // reply, a partial line, and a stall during Unix FD negotiation.
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(connection.fd, linux.F.SETFL, 0)));
+        if (reply.len > 0) try std.testing.expectEqual(reply.len, linux.write(pair[1], reply.ptr, reply.len));
+        try std.testing.expectError(error.Timeout, connection.authenticate());
+    }
+}
+
+test "authentication times out under write backpressure" {
+    const pair = try testSocketConnection(std.testing.allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    defer _ = linux.close(pair[1]);
+    var fill: [4096]u8 = @splat(0);
+    while (true) {
+        const rc = linux.write(connection.fd, &fill, fill.len);
+        if (linux.errno(rc) == .AGAIN) break;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
+        try std.testing.expect(rc > 0);
+    }
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(connection.fd, linux.F.SETFL, 0)));
+    try std.testing.expectError(error.Timeout, connection.authenticate());
+}
+
+test "authentication accepts Unix FD negotiation success and refusal" {
+    for ([_][]const u8{ "AGREE_UNIX_FD", "ERROR unsupported" }, [_]bool{ true, false }) |negotiation, enabled| {
+        const pair = try testSocketConnection(std.testing.allocator);
+        var connection = pair[0];
+        defer connection.deinit();
+        defer _ = linux.close(pair[1]);
+        connection.unix_fd_enabled = false;
+        const reply = try std.fmt.allocPrint(std.testing.allocator, "OK bus\r\n{s}\r\n", .{negotiation});
+        defer std.testing.allocator.free(reply);
+        try std.testing.expectEqual(reply.len, linux.write(pair[1], reply.ptr, reply.len));
+        try connection.authenticate();
+        try std.testing.expectEqual(enabled, connection.unix_fd_enabled);
+
+        var sent: [256]u8 = undefined;
+        const n = try posix.read(pair[1], &sent);
+        try std.testing.expect(std.mem.startsWith(u8, sent[0..n], "\x00AUTH EXTERNAL "));
+        try std.testing.expect(std.mem.endsWith(u8, sent[0..n], "\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n"));
+    }
+}
+
+test "authentication I/O honors an expired deadline even on a ready socket" {
+    const pair = try testSocketConnection(std.testing.allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    defer _ = linux.close(pair[1]);
+    try std.testing.expectEqual(@as(usize, 4), linux.write(pair[1], "OK\r\n", 4));
+    const deadline = std.Io.Clock.awake.now(connection.io).subDuration(.fromMilliseconds(1));
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectError(error.Timeout, connection.readAuthLine(&buffer, deadline));
+    try std.testing.expectError(error.Timeout, connection.writeAuth("BEGIN\r\n", deadline));
 }
 
 test "backpressure preserves queued order and duplicated fd ownership" {
