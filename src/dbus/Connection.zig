@@ -138,7 +138,10 @@ pub fn getFd(self: *const Connection) posix.fd_t {
 }
 
 pub fn hasQueuedMessages(self: *const Connection) bool {
-    return self.messages.items.len != 0;
+    if (self.messages.items.len != 0) return true;
+    // Buffered frames need dispatch even when the socket is no longer readable.
+    // Malformed framing also needs dispatch so the caller observes the error.
+    return (wire.messageLength(self.receive_buffer.items) catch return true) != null;
 }
 
 pub fn hasPendingWrites(self: *const Connection) bool {
@@ -213,11 +216,12 @@ pub fn waitForReply(self: *Connection, serial: u32, timeout_ms: u32) !Message {
     const timeout_ns: i96 = @as(i96, timeout_ms) * std.time.ns_per_ms;
     while (true) {
         if (self.takeReply(serial)) |reply| return reply;
-        try self.readAvailable();
+        const received = try self.readAvailable();
         if (self.takeReply(serial)) |reply| return reply;
 
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         if (elapsed >= timeout_ns) return error.Timeout;
+        if (received) continue;
         const remaining_ns = timeout_ns - elapsed;
         const remaining_ms: i32 = @intCast(@min(
             @as(i96, std.math.maxInt(i32)),
@@ -239,7 +243,7 @@ pub fn waitForReply(self: *Connection, serial: u32, timeout_ms: u32) !Message {
 /// Return one queued or newly received message without blocking. The caller
 /// owns a returned message and must call `Message.deinit`.
 pub fn nextMessage(self: *Connection) !?Message {
-    if (self.messages.items.len == 0) try self.readAvailable();
+    if (self.messages.items.len == 0) _ = try self.readAvailable();
     if (self.messages.items.len == 0) return null;
     return self.messages.orderedRemove(0);
 }
@@ -353,8 +357,11 @@ pub fn flushWrites(self: *Connection) !void {
     }
 }
 
-fn readAvailable(self: *Connection) !void {
+/// Queue at most one complete message. Dispatch must keep pace with reads:
+/// draining the socket first can overflow the queue on a valid signal burst.
+fn readAvailable(self: *Connection) !bool {
     while (true) {
+        if (try self.parseMessage()) return true;
         var data: [receive_buffer_size]u8 = undefined;
         var control: [receive_control_size]u8 align(@alignOf(linux.cmsghdr)) = undefined;
         var iov = [_]posix.iovec{.{ .base = &data, .len = data.len }};
@@ -377,10 +384,9 @@ fn readAvailable(self: *Connection) !void {
                 }
                 try self.collectFds(control[0..message.controllen]);
                 try self.receive_buffer.appendSlice(self.allocator, data[0..rc]);
-                try self.parseMessages();
             },
             .INTR => continue,
-            .AGAIN => return,
+            .AGAIN => return false,
             .CONNRESET, .NOTCONN => return error.ConnectionClosed,
             else => return error.ProtocolError,
         }
@@ -459,8 +465,8 @@ fn closeControlFds(control: []const u8) void {
     }
 }
 
-fn parseMessages(self: *Connection) !void {
-    while (try wire.messageLength(self.receive_buffer.items)) |length| {
+fn parseMessage(self: *Connection) !bool {
+    if (try wire.messageLength(self.receive_buffer.items)) |length| {
         if (self.messages.items.len >= max_queued_messages) return error.ProtocolError;
         try self.messages.ensureUnusedCapacity(self.allocator, 1);
         const owned_data = try self.allocator.dupe(u8, self.receive_buffer.items[0..length]);
@@ -512,7 +518,9 @@ fn parseMessages(self: *Connection) !void {
             self.receive_buffer.items[length..],
         );
         self.receive_buffer.items.len = remaining;
+        return true;
     }
+    return false;
 }
 
 fn takeReply(self: *Connection, serial: u32) ?Message {
@@ -685,6 +693,96 @@ fn testSocketConnection(allocator: std.mem.Allocator) !struct { Connection, posi
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0, &sockets);
     if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
     return .{ .{ .allocator = allocator, .io = std.testing.io, .fd = sockets[0], .unix_fd_enabled = true }, sockets[1] };
+}
+
+test "incoming burst is dispatched without overflowing the reply queue" {
+    const allocator = std.testing.allocator;
+    const pair = try testSocketConnection(allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    defer _ = linux.close(pair[1]);
+
+    var burst: std.Io.Writer.Allocating = .init(allocator);
+    defer burst.deinit();
+    const count = max_queued_messages + 1;
+    for (0..count) |i| {
+        const data = try wire.encodeMessage(allocator, .{
+            .message_type = .signal,
+            .path = "/a",
+            .interface = "a.b",
+            .member = "Changed",
+        }, @intCast(i + 1), &.{}, 0);
+        defer allocator.free(data);
+        try burst.writer.writeAll(data);
+    }
+    const bytes = burst.written();
+    try std.testing.expectEqual(bytes.len, linux.write(pair[1], bytes.ptr, bytes.len));
+    for (0..count) |i| {
+        var message = (try connection.nextMessage()) orelse return error.MissingMessage;
+        defer message.deinit();
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), message.header.serial);
+    }
+    try std.testing.expectEqual(null, try connection.nextMessage());
+}
+
+test "reply wait consumes buffered frames and preserves surrounding signals" {
+    const allocator = std.testing.allocator;
+    const pair = try testSocketConnection(allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    defer _ = linux.close(pair[1]);
+
+    var burst: std.Io.Writer.Allocating = .init(allocator);
+    defer burst.deinit();
+    for (0..3) |i| {
+        const metadata: wire.Metadata = if (i == 1)
+            .{ .message_type = .method_return, .reply_serial = 42 }
+        else
+            .{ .message_type = .signal, .path = "/a", .interface = "a.b", .member = "Changed" };
+        const data = try wire.encodeMessage(allocator, metadata, @intCast(i + 1), &.{}, 0);
+        defer allocator.free(data);
+        try burst.writer.writeAll(data);
+    }
+    const bytes = burst.written();
+    // An incomplete header is not ready work and must not make the poll loop spin.
+    try std.testing.expectEqual(@as(usize, 8), linux.write(pair[1], bytes.ptr, 8));
+    try std.testing.expectEqual(null, try connection.nextMessage());
+    try std.testing.expect(!connection.hasQueuedMessages());
+    try std.testing.expectEqual(bytes.len - 8, linux.write(pair[1], bytes.ptr + 8, bytes.len - 8));
+
+    var reply = try connection.waitForReply(42, 100);
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reply.header.serial);
+    var first = (try connection.nextMessage()).?;
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u32, 1), first.header.serial);
+    try std.testing.expectEqual(@as(usize, 0), connection.messages.items.len);
+    try std.testing.expect(connection.hasQueuedMessages());
+    var last = (try connection.nextMessage()).?;
+    defer last.deinit();
+    try std.testing.expectEqual(@as(u32, 3), last.header.serial);
+    try std.testing.expect(!connection.hasQueuedMessages());
+    try std.testing.expectEqual(null, try connection.nextMessage());
+}
+
+test "complete message is delivered before peer EOF" {
+    const allocator = std.testing.allocator;
+    const pair = try testSocketConnection(allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    const data = try wire.encodeMessage(allocator, .{
+        .message_type = .method_return,
+        .reply_serial = 42,
+    }, 1, &.{}, 0);
+    defer allocator.free(data);
+    const written = linux.write(pair[1], data.ptr, data.len);
+    _ = linux.close(pair[1]);
+    try std.testing.expectEqual(data.len, written);
+
+    var reply = try connection.waitForReply(42, 100);
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(u32, 42), reply.header.reply_serial.?);
+    try std.testing.expectError(error.ConnectionClosed, connection.nextMessage());
 }
 
 test "authentication times out for silent and stalled peers" {
