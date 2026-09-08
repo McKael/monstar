@@ -1901,7 +1901,7 @@ fn spawnNewWindow(self: *App) void {
         log.err("spawn env setup failed: {}", .{err});
         return;
     };
-    const exe_path = resolveCommandPathZ(arena, self.environ, "monstar") catch "monstar";
+    const exe_path = resolveCommandPathZ(arena, self.environ, "monstar", null) catch "monstar";
 
     self.spawnSystemdRun(arena, envp, exe_path, pwd) catch |err| {
         log.err("new window launch failed: {}", .{err});
@@ -1915,7 +1915,7 @@ fn spawnSystemdRun(
     exe_path: [:0]const u8,
     pwd: ?[:0]const u8,
 ) !void {
-    const systemd_run = try resolveCommandPath(arena, self.environ, "systemd-run");
+    const systemd_run = try resolveCommandPath(arena, self.environ, "systemd-run", null);
 
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "systemd-run", "--user", "--collect" });
@@ -2005,14 +2005,18 @@ pub fn resolveCommandPath(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     command: [:0]const u8,
+    cwd: ?[:0]const u8,
 ) ![*:0]const u8 {
-    return (try resolveCommandPathZ(arena, environ, command)).ptr;
+    return (try resolveCommandPathZ(arena, environ, command, cwd)).ptr;
 }
 
+/// Search PATH relative to the child's working directory (null inherits ours).
+/// Returned relative paths must be executed from that directory, not ours.
 pub fn resolveCommandPathZ(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     command: [:0]const u8,
+    cwd: ?[:0]const u8,
 ) ![:0]const u8 {
     if (std.mem.indexOfScalar(u8, command, '/') != null) return command;
 
@@ -2021,17 +2025,21 @@ pub fn resolveCommandPathZ(
     while (dirs.next()) |dir| {
         const base = if (dir.len == 0) "." else dir;
         const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, command }, 0);
+        const probe = if (cwd != null and !std.fs.path.isAbsolute(candidate))
+            try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ cwd.?, candidate }, 0)
+        else
+            candidate;
         var stat = std.mem.zeroes(std.os.linux.Statx);
         const stat_rc = std.os.linux.statx(
             std.os.linux.AT.FDCWD,
-            candidate,
+            probe,
             std.os.linux.AT.NO_AUTOMOUNT,
             .{ .TYPE = true },
             &stat,
         );
         if (std.os.linux.errno(stat_rc) == .SUCCESS and stat.mask.TYPE and
             std.os.linux.S.ISREG(stat.mode) and
-            std.os.linux.errno(std.os.linux.access(candidate, std.os.linux.X_OK)) == .SUCCESS)
+            std.os.linux.errno(std.os.linux.access(probe, std.os.linux.X_OK)) == .SUCCESS)
         {
             return candidate;
         }
@@ -3504,7 +3512,7 @@ fn openUriXdg(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !voi
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const xdg_open = try resolveCommandPathZ(arena, self.environ, "xdg-open");
+    const xdg_open = try resolveCommandPathZ(arena, self.environ, "xdg-open", null);
     if (std.mem.indexOfScalar(u8, xdg_open, '/') == null) return error.XdgOpenUnavailable;
 
     const uri_z = try arena.dupeZ(u8, uri);

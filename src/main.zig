@@ -261,7 +261,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
     try config.resolveThemes(init.io, arena, init.minimal.environ);
     if (cli.working_directory) |cwd| try validateWorkingDirectory(cwd);
 
-    const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command);
+    const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command, cli.working_directory);
     const envp = try buildEnvp(init.io, arena, init.minimal.environ);
 
     const app = try App.init(
@@ -296,6 +296,7 @@ fn buildCommand(
     environ: std.process.Environ,
     mode: CommandMode,
     command: []const [:0]const u8,
+    cwd: ?[:0]const u8,
 ) !ChildCommand {
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     var path: [*:0]const u8 = undefined;
@@ -305,7 +306,7 @@ fn buildCommand(
             try argv.appendSlice(arena, &.{ "/bin/sh", "-c", try std.mem.joinZ(arena, " ", command) });
         },
         .exec => {
-            path = try App.resolveCommandPath(arena, environ, command[0]);
+            path = try App.resolveCommandPath(arena, environ, command[0], cwd);
             for (command) |arg| try argv.append(arena, arg.ptr);
         },
     } else if (config.command) |configured| switch (configured) {
@@ -314,7 +315,7 @@ fn buildCommand(
             try argv.appendSlice(arena, &.{ "/bin/sh", "-c", value.ptr });
         },
         .direct => |args| {
-            path = try App.resolveCommandPath(arena, environ, args[0]);
+            path = try App.resolveCommandPath(arena, environ, args[0], cwd);
             for (args) |arg| try argv.append(arena, arg.ptr);
         },
     } else {
@@ -456,6 +457,7 @@ test "configured shell command runs through sh" {
         .empty,
         .shell,
         &.{},
+        null,
     );
     try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.path));
     try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.argv[0].?));
@@ -472,10 +474,57 @@ test "configured direct command preserves arguments" {
         .empty,
         .shell,
         &.{},
+        null,
     );
     try std.testing.expectEqualStrings("/usr/bin/env", std.mem.span(command.path));
     try std.testing.expectEqualStrings("/usr/bin/env", std.mem.span(command.argv[0].?));
     try std.testing.expectEqualStrings("A=B", std.mem.span(command.argv[1].?));
+}
+
+test "direct commands search PATH in the child working directory" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bin/monstar-path-test",
+        .data = "#!/bin/sh\nexit 42\n",
+        .flags = .{ .permissions = .fromMode(0o700) },
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "monstar-path-test",
+        .data = "#!/bin/sh\nexit 41\n",
+        .flags = .{ .permissions = .fromMode(0o700) },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const cwd = try arena.dupeZ(u8, path_buf[0..path_len]);
+    const cases = [_]struct { path: [:0]const u8, exit_code: u32 }{
+        .{ .path = "PATH=bin", .exit_code = 42 },
+        .{ .path = "PATH=bin:.", .exit_code = 42 },
+        .{ .path = "PATH=:bin", .exit_code = 41 },
+        .{ .path = try std.fmt.allocPrintSentinel(arena, "PATH={s}/bin", .{cwd}, 0), .exit_code = 42 },
+    };
+    for (cases) |case| {
+        const envp = [_:null]?[*:0]const u8{case.path.ptr};
+        const environ: std.process.Environ = .{ .block = .{ .slice = &envp } };
+        for ([_]bool{ false, true }) |configured| {
+            const command = try buildCommand(
+                arena,
+                if (configured) .{ .command = .{ .direct = &.{"monstar-path-test"} } } else .{},
+                environ,
+                .exec,
+                if (configured) &.{} else &.{"monstar-path-test"},
+                cwd,
+            );
+            var pty: Pty = try .open(.{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 });
+            defer pty.deinit();
+            const pid = try pty.spawn(command.path, command.argv.ptr, &envp, .{ .cwd = cwd });
+            try std.testing.expectEqual(case.exit_code << 8, try Pty.wait(pid));
+        }
+    }
 }
 
 test "parse CLI reserves bare words for future subcommands" {
