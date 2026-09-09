@@ -505,6 +505,8 @@ test "direct commands search PATH in the child working directory" {
         .{ .path = "PATH=bin", .exit_code = 42 },
         .{ .path = "PATH=bin:.", .exit_code = 42 },
         .{ .path = "PATH=:bin", .exit_code = 41 },
+        .{ .path = "PATH=.", .exit_code = 41 },
+        .{ .path = "PATH=", .exit_code = 41 },
         .{ .path = try std.fmt.allocPrintSentinel(arena, "PATH={s}/bin", .{cwd}, 0), .exit_code = 42 },
     };
     for (cases) |case| {
@@ -525,6 +527,27 @@ test "direct commands search PATH in the child working directory" {
             try std.testing.expectEqual(case.exit_code << 8, try Pty.wait(pid));
         }
     }
+
+    // A failed PATH search must not implicitly execute the copy in cwd.
+    const envp = [_:null]?[*:0]const u8{"PATH=missing"};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &envp } };
+    for ([_]bool{ false, true }) |configured| {
+        try std.testing.expectError(error.CommandNotFound, buildCommand(
+            arena,
+            if (configured) .{ .command = .{ .direct = &.{"monstar-path-test"} } } else .{},
+            environ,
+            .exec,
+            if (configured) &.{} else &.{"monstar-path-test"},
+            cwd,
+        ));
+    }
+
+    // An explicit relative path bypasses PATH, even when lookup would fail.
+    const command = try buildCommand(arena, .{}, environ, .exec, &.{"./monstar-path-test"}, cwd);
+    var pty: Pty = try .open(.{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 });
+    defer pty.deinit();
+    const pid = try pty.spawn(command.path, command.argv.ptr, &envp, .{ .cwd = cwd });
+    try std.testing.expectEqual(@as(u32, 41 << 8), try Pty.wait(pid));
 }
 
 test "parse CLI reserves bare words for future subcommands" {

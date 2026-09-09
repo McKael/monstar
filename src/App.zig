@@ -2012,6 +2012,7 @@ pub fn resolveCommandPath(
 
 /// Search PATH relative to the child's working directory (null inherits ours).
 /// Returned relative paths must be executed from that directory, not ours.
+/// Explicit paths bypass lookup; a failed search returns CommandNotFound.
 pub fn resolveCommandPathZ(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
@@ -2044,7 +2045,7 @@ pub fn resolveCommandPathZ(
             return candidate;
         }
     }
-    return command;
+    return error.CommandNotFound;
 }
 
 /// Ctrl+Shift+Z/X: move the scrollback viewport between OSC 133 prompt marks.
@@ -3513,7 +3514,6 @@ fn openUriXdg(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !voi
     const arena = arena_state.allocator();
 
     const xdg_open = try resolveCommandPathZ(arena, self.environ, "xdg-open", null);
-    if (std.mem.indexOfScalar(u8, xdg_open, '/') == null) return error.XdgOpenUnavailable;
 
     const uri_z = try arena.dupeZ(u8, uri);
     const envp = try self.spawnEnvp(arena, null, activation_token);
