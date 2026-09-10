@@ -41,6 +41,40 @@ pub fn preferredMime(preferences: []const [:0]const u8, mask: MimeMask) ?[*:0]co
     return null;
 }
 
+/// Encode UTF-8 as an ICCCM STRING selection (Latin-1 plus TAB and NEWLINE).
+/// The caller owns the result. Null means the text cannot be represented
+/// losslessly and STRING must not be offered for this selection.
+pub fn encodeLatin1(alloc: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error!?[]u8 {
+    const view = std.unicode.Utf8View.init(text) catch return null;
+    var it = view.iterator();
+    var len: usize = 0;
+    while (it.nextCodepoint()) |cp| {
+        if (!(cp == '\t' or cp == '\n' or
+            (cp >= 0x20 and cp <= 0x7e) or (cp >= 0xa0 and cp <= 0xff))) return null;
+        len += 1;
+    }
+    const result = try alloc.alloc(u8, len);
+    it = view.iterator();
+    for (result) |*byte| byte.* = @intCast(it.nextCodepoint().?);
+    return result;
+}
+
+test "STRING selections use Latin-1 without replacing unrepresentable text" {
+    const cases = [_]struct { text: []const u8, expected: []const u8 }{
+        .{ .text = "", .expected = "" },
+        .{ .text = "plain\ttext\n", .expected = "plain\ttext\n" },
+        .{ .text = "café £ÿ", .expected = "caf\xe9 \xa3\xff" },
+    };
+    for (cases) |case| {
+        const encoded = (try encodeLatin1(std.testing.allocator, case.text)).?;
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectEqualStrings(case.expected, encoded);
+    }
+    for ([_][]const u8{ "€", "Ā", "🙂", "\x00", "\r", "\x7f", "\u{85}", "\xff" }) |text| {
+        try std.testing.expectEqual(null, try encodeLatin1(std.testing.allocator, text));
+    }
+}
+
 /// Decode an OSC 7 payload (`file://host/path`) into a local filesystem
 /// path. Returns null for anything that is not an absolute path on this
 /// machine: foreign schemes, remote hosts, malformed URIs.

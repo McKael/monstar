@@ -177,10 +177,12 @@ const PrimaryOffer = struct {
 };
 
 /// Heap context for an outgoing selection source. It owns both the sentinel
-/// text and source proxy until cancellation, replacement, or teardown.
+/// text and its optional Latin-1 representation, plus the source proxy,
+/// until cancellation, replacement, or teardown.
 const Source = struct {
     clipboard: *Clipboard,
     text: [:0]const u8,
+    latin1: ?[]const u8,
     source: union(enum) {
         clipboard: *wl.DataSource,
         primary: *zwp.PrimarySelectionSourceV1,
@@ -198,12 +200,24 @@ const Source = struct {
                 source.destroy();
             },
         }
+        if (self.latin1) |text| clipboard.alloc.free(text);
         clipboard.alloc.free(self.text);
         clipboard.alloc.destroy(self);
     }
 
-    fn send(self: *Source, fd: i32) void {
-        self.clipboard.sendSelection(self.text, fd);
+    fn supportsMime(self: *const Source, mime: [:0]const u8) bool {
+        return !std.mem.eql(u8, mime, "STRING") or self.latin1 != null;
+    }
+
+    fn send(self: *Source, mime: [*:0]const u8, fd: i32) void {
+        const text = if (std.mem.eql(u8, std.mem.span(mime), "STRING"))
+            self.latin1 orelse {
+                _ = std.os.linux.close(fd);
+                return;
+            }
+        else
+            self.text;
+        self.clipboard.sendSelection(text, fd);
     }
 };
 
@@ -552,8 +566,15 @@ fn claimClipboard(self: *Clipboard, text: [:0]const u8, serial: u32) bool {
         self.alloc.free(text);
         return false;
     };
-    ctx.* = .{ .clipboard = self, .text = text, .source = .{ .clipboard = source } };
-    inline for (clipboard_format.paste_mime_preference) |mime| source.offer(mime.ptr);
+    ctx.* = .{
+        .clipboard = self,
+        .text = text,
+        .latin1 = clipboard_format.encodeLatin1(self.alloc, text) catch null,
+        .source = .{ .clipboard = source },
+    };
+    inline for (clipboard_format.paste_mime_preference) |mime| {
+        if (ctx.supportsMime(mime)) source.offer(mime.ptr);
+    }
     source.setListener(*Source, dataSourceListener, ctx);
     device.setSelection(source, serial);
     if (self.clip_source) |old| old.destroy();
@@ -580,8 +601,15 @@ fn claimPrimary(self: *Clipboard, text: [:0]const u8, serial: u32) bool {
         self.alloc.free(text);
         return false;
     };
-    ctx.* = .{ .clipboard = self, .text = text, .source = .{ .primary = source } };
-    inline for (clipboard_format.paste_mime_preference) |mime| source.offer(mime.ptr);
+    ctx.* = .{
+        .clipboard = self,
+        .text = text,
+        .latin1 = clipboard_format.encodeLatin1(self.alloc, text) catch null,
+        .source = .{ .primary = source },
+    };
+    inline for (clipboard_format.paste_mime_preference) |mime| {
+        if (ctx.supportsMime(mime)) source.offer(mime.ptr);
+    }
     source.setListener(*Source, primarySourceListener, ctx);
     device.setSelection(source, serial);
     if (self.primary_source) |old| old.destroy();
@@ -666,7 +694,7 @@ fn beginDrop(self: *Clipboard) void {
 
 fn dataSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *Source) void {
     switch (event) {
-        .send => |send| ctx.send(send.fd),
+        .send => |send| ctx.send(send.mime_type, send.fd),
         .cancelled => ctx.destroy(),
         else => {},
     }
@@ -678,7 +706,7 @@ fn primarySourceListener(
     ctx: *Source,
 ) void {
     switch (event) {
-        .send => |send| ctx.send(send.fd),
+        .send => |send| ctx.send(send.mime_type, send.fd),
         .cancelled => ctx.destroy(),
     }
 }
@@ -969,6 +997,48 @@ test "selection writer survives a consumer closing early" {
     _ = try posix.poll(&polls, 0);
     clipboard.dispatchOutgoing(&polls);
     try std.testing.expectEqual(@as(usize, 0), clipboard.outgoing_bytes);
+}
+
+test "selection source callbacks honor the requested text encoding" {
+    const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
+    const cases = [_]struct { text: [:0]const u8, latin1: ?[]const u8 }{
+        .{ .text = "café £ÿ\n", .latin1 = "caf\xe9 \xa3\xff\n" },
+        .{ .text = "price: 5€", .latin1 = null },
+    };
+    for (cases) |case| {
+        var source: Source = .{
+            .clipboard = &clipboard,
+            .text = case.text,
+            .latin1 = try clipboard_format.encodeLatin1(std.testing.allocator, case.text),
+            .source = undefined,
+        };
+        defer if (source.latin1) |text| std.testing.allocator.free(text);
+        try std.testing.expectEqual(case.latin1 != null, source.supportsMime("STRING"));
+        for ([_]Target{ .clipboard, .primary }) |target| {
+            for (clipboard_format.paste_mime_preference) |mime| {
+                const is_latin1 = std.mem.eql(u8, mime, "STRING");
+                if (!is_latin1) try std.testing.expect(source.supportsMime(mime));
+                var fds: [2]posix.fd_t = undefined;
+                try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+                defer _ = linux.close(fds[0]);
+                switch (target) {
+                    .clipboard => dataSourceListener(undefined, .{ .send = .{ .mime_type = mime, .fd = fds[1] } }, &source),
+                    .primary => primarySourceListener(undefined, .{ .send = .{ .mime_type = mime, .fd = fds[1] } }, &source),
+                }
+                var polls: [max_outgoing_transfers]posix.pollfd = undefined;
+                clipboard.pollOutgoing(&polls);
+                _ = try posix.poll(&polls, 0);
+                clipboard.dispatchOutgoing(&polls);
+                var buf: [64]u8 = undefined;
+                const n = try posix.read(fds[0], &buf);
+                try std.testing.expectEqualStrings(if (is_latin1) case.latin1 orelse "" else case.text, buf[0..n]);
+                try std.testing.expectEqual(@as(usize, 0), try posix.read(fds[0], &buf));
+                try std.testing.expectEqual(@as(usize, 0), clipboard.outgoing_bytes);
+            }
+        }
+    }
 }
 
 test "outgoing limits, timeout, and teardown close transfers" {
