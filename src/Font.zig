@@ -4,7 +4,8 @@
 //! fonts, FreeType to rasterize glyphs, and exposes a HarfBuzz font per
 //! face for shaping. The primary face defines the cell metrics; fallback
 //! faces are loaded lazily (at the same pixel size) when the primary lacks
-//! a grapheme cluster, walking the fontconfig sort order and verifying
+//! a grapheme cluster or emoji presentation prefers a color face,
+//! walking the fontconfig sort order and verifying
 //! that a candidate's cmap covers every non-ignorable codepoint in the
 //! cluster before accepting it.
 
@@ -1020,11 +1021,10 @@ pub fn decorationGlyph(
     return gop.value_ptr;
 }
 
-/// The face to render `cp` with: 0 (primary) when the primary covers it
-/// or nothing does, otherwise the embedded symbols face or a
-/// lazily-loaded system fallback, in that order. The embedded face wins
-/// over system fonts so icons render identically everywhere; it only
-/// contains symbols, so it never shadows regular text coverage.
+/// The face to render `cp` with. Emoji-default codepoints prefer a color
+/// face; otherwise primary coverage wins, followed by embedded symbols
+/// and system fallbacks. Grid glyphs use sprites. Returns 0 (primary)
+/// when no face covers the codepoint.
 pub fn faceForCodepoint(self: *Font, alloc: std.mem.Allocator, cp: u21) u16 {
     return self.faceForCluster(alloc, &.{cp}, .regular);
 }
@@ -1047,7 +1047,7 @@ const ClusterInfo = struct {
     /// when the primary covers the base (text-style hearts, keycap digits).
     explicit_emoji: bool,
     /// The base codepoint defaults to emoji presentation: color faces are
-    /// preferred over other fallbacks, but a covering primary still wins.
+    /// preferred even when the primary covers it, unless VS15 forces text.
     default_emoji: bool,
 
     fn init(cps: []const u21) ClusterInfo {
@@ -1132,7 +1132,7 @@ pub const ClusterCandidates = struct {
     /// duplicates slip through, which callers bound with attempt limits.
     const max_returned = 8;
 
-    const Stage = enum { color_front, styled_primary, primary, embedded, color, any, done };
+    const Stage = enum { color_front, styled_primary, primary, embedded, any, done };
 
     pub fn next(self: *ClusterCandidates, alloc: std.mem.Allocator) ?u16 {
         while (true) {
@@ -1159,19 +1159,11 @@ pub const ClusterCandidates = struct {
                     }
                 },
                 .embedded => {
-                    self.stage = if (self.info.default_emoji and !self.info.explicit_emoji) .color else .any;
+                    self.stage = .any;
                     if (self.font.embedded_face) |idx| {
                         if (self.covers(idx)) {
                             if (self.take(idx)) |taken| return taken;
                         }
-                    }
-                },
-                .color => {
-                    if (self.nextSortCandidate(alloc, true)) |idx| {
-                        if (self.take(idx)) |taken| return taken;
-                    } else {
-                        self.stage = .any;
-                        self.sort_index = 0;
                     }
                 },
                 .any => {
@@ -1230,7 +1222,7 @@ pub fn clusterCandidates(self: *Font, cps: []const u21, style: FaceStyle) Cluste
         .font = self,
         .style = style,
         .info = info,
-        .stage = if (info.explicit_emoji) .color_front else .styled_primary,
+        .stage = if (info.explicit_emoji or info.default_emoji) .color_front else .styled_primary,
     };
 }
 
@@ -1279,7 +1271,7 @@ fn resolveCluster(self: *Font, alloc: std.mem.Allocator, info: ClusterInfo, styl
         .font = self,
         .style = style,
         .info = info,
-        .stage = if (info.explicit_emoji) .color_front else .styled_primary,
+        .stage = if (info.explicit_emoji or info.default_emoji) .color_front else .styled_primary,
     };
     return candidates.next(alloc) orelse 0;
 }
@@ -1346,6 +1338,7 @@ pub fn hasDefaultEmojiPresentation(cp: u21) bool {
 
 test "default emoji presentation uses Unicode data" {
     try std.testing.expect(hasDefaultEmojiPresentation(0x1F600)); // 😀
+    try std.testing.expect(hasDefaultEmojiPresentation(0x26A1)); // ⚡
     try std.testing.expect(hasDefaultEmojiPresentation(0x2B1B)); // ⬛
     try std.testing.expect(!hasDefaultEmojiPresentation(0x2600)); // ☀ defaults to text
     try std.testing.expect(!hasDefaultEmojiPresentation('A'));
@@ -1517,6 +1510,33 @@ test "fallback face for a codepoint the primary lacks" {
     try std.testing.expect(fallback.hasCodepoint(cp));
     // Cached second lookup returns the same face.
     try std.testing.expectEqual(idx, font.faceForCodepoint(alloc, cp));
+}
+
+test "emoji presentation wins over a covering primary unless VS15 forces text" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "DejaVu Sans Mono", 16, null);
+    defer font.deinit(alloc);
+
+    const cp: u21 = 0x26A1; // high voltage defaults to emoji
+    if (!font.face(0).hasCodepoint(cp)) return error.SkipZigTest;
+    var candidates = font.clusterCandidates(&.{cp}, .regular);
+    // Check availability independently of the selection order under test.
+    const color_idx = candidates.nextSortCandidate(alloc, true) orelse return error.SkipZigTest;
+
+    for ([_]FaceStyle{ .regular, .bold, .italic, .bold_italic }) |style| {
+        const idx = font.faceForCluster(alloc, &.{cp}, style);
+        const emoji_face = font.face(idx);
+        const glyph = try emoji_face.glyph(alloc, c.FT_Get_Char_Index(emoji_face.ft_face, cp), 2, false);
+        try std.testing.expectEqual(GlyphFormat.bgra, glyph.format);
+        try std.testing.expectEqual(idx, font.faceForCluster(alloc, &.{ cp, 0xFE0F }, style));
+        try std.testing.expectEqual(idx, font.faceForCluster(alloc, &.{cp}, style)); // cached
+
+        var retry_candidates = font.clusterCandidates(&.{cp}, style);
+        try std.testing.expectEqual(idx, retry_candidates.next(alloc).?);
+    }
+    try std.testing.expectEqual(color_idx, font.faceForCodepoint(alloc, cp));
+    try std.testing.expectEqual(@as(u16, 0), font.faceForCluster(alloc, &.{ cp, 0xFE0E }, .regular));
+    try std.testing.expectEqual(@as(u16, 0), font.faceForCodepoint(alloc, 0x2600)); // sun defaults to text
 }
 
 test "color emoji fallback rasterizes as scaled BGRA" {
