@@ -163,7 +163,7 @@ Other settings:
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for line
-  scrolling. See [Keybindings](#keybindings) below.
+  scrolling and opening new windows. See [Keybindings](#keybindings) below.
 - **background / foreground / cursor-color / cursor-text** — Terminal colors
   as `#RRGGBB` or `RRGGBB`; explicit colors override the theme.
   `cursor-color` and `cursor-text` also accept `cell-foreground` and
@@ -184,7 +184,7 @@ settings apply to new windows.
 
 ## Keybindings
 
-Configure line scrolling with repeatable `keybind` entries:
+Configure line scrolling and new windows with repeatable `keybind` entries:
 
 ```conf
 # Default line-scrolling bindings:
@@ -195,9 +195,13 @@ keybind = ctrl+shift+k=scroll_page_lines:-5
 keybind = alt+j=scroll_page_lines:5
 # Remove a default shortcut:
 keybind = shift+up=unbind
+# Move new windows from the default Ctrl+Shift+N:
+keybind = ctrl+shift+enter=new_window
+keybind = ctrl+shift+n=unbind
 ```
 
-Negative counts scroll up; positive counts scroll down. Counts range from
+`new_window` opens an independent window in the current directory.
+For `scroll_page_lines`, negative counts scroll up; positive counts scroll down. Counts range from
 `-32768` to `32767`. Multiple triggers can invoke the same action; repeating a
 trigger replaces its previous binding. Invalid entries leave previous bindings
 unchanged. Bindings reload with the configuration.
@@ -211,8 +215,8 @@ Include Shift when it is held to produce punctuation, for example
 `keybind = ctrl+shift++=scroll_page_lines:-5` on a US keyboard.
 
 Configured bindings take precedence over fixed shortcuts below; `unbind`
-passes the key to the application instead. Only `scroll_page_lines` and
-`unbind` are currently supported actions. Ghostty sequences, binding flags,
+passes the key to the application instead. Only `scroll_page_lines`,
+`new_window`, and `unbind` are currently supported actions. Ghostty sequences, binding flags,
 and other actions are not yet supported. Search mode retains its own controls.
 
 | Shortcut | Action |

@@ -31,6 +31,7 @@ const vt = @import("ghostty-vt");
 const uucode = @import("uucode");
 
 pub const Action = union(enum) {
+    new_window,
     scroll_page_lines: i16,
     unbind,
 };
@@ -57,6 +58,7 @@ pub const Trigger = struct {
 const defaults = [_]Binding{
     .{ .trigger = .{ .key = .{ .physical = .arrow_up }, .mods = .{ .shift = true } }, .action = .{ .scroll_page_lines = -1 } },
     .{ .trigger = .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true } }, .action = .{ .scroll_page_lines = 1 } },
+    .{ .trigger = .{ .key = .{ .unicode = 'n' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .new_window },
 };
 
 /// Parse without allocating. Only single-key triggers and the actions in Action
@@ -77,6 +79,8 @@ pub fn parse(input: []const u8) error{InvalidValue}!Binding {
     const action_text = std.mem.trim(u8, input[eq + 1 ..], " \t");
     const action: Action = if (std.mem.eql(u8, action_text, "unbind"))
         .unbind
+    else if (std.mem.eql(u8, action_text, "new_window"))
+        .new_window
     else if (std.mem.startsWith(u8, action_text, "scroll_page_lines:"))
         .{ .scroll_page_lines = std.fmt.parseInt(i16, action_text["scroll_page_lines:".len..], 10) catch return error.InvalidValue }
     else
@@ -223,8 +227,8 @@ test "Ghostty single-key syntax and action parameters" {
     for ([_][]const u8{
         "",                    "ctrl=unbind",               "ctrl+control+a=unbind",      "a+b=unbind",              "=unbind",
         "a=scroll_page_lines", "a=scroll_page_lines:32768", "a=scroll_page_lines:-32769", "a=scroll_page_lines:1.5", "a=scroll_page_lines:",
-        "a=unknown",           "a=unbind:1",                "ctrl+not-a-key=unbind",      "a>b=unbind",              "global:a=unbind",
-        "chain=unbind",        "catch_all=unbind",          "\xff=unbind",
+        "a=unknown",           "a=unbind:1",                "a=new_window:1",             "ctrl+not-a-key=unbind",   "a>b=unbind",
+        "global:a=unbind",     "chain=unbind",              "catch_all=unbind",           "\xff=unbind",
     }) |text| try std.testing.expectError(error.InvalidValue, parse(text));
 }
 

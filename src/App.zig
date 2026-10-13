@@ -2090,9 +2090,9 @@ fn reloadConfig(self: *App) void {
     log.info("config reloaded", .{});
 }
 
-/// Ctrl+Shift+N: spawn an independent monstar window in the shell's
-/// current directory through the user service manager so the new window
-/// is not adopted by this monstar's launcher.
+/// `new_window` (default Ctrl+Shift+N): spawn an independent monstar window
+/// in the shell's current directory through the user service manager so the
+/// new window is not adopted by this monstar's launcher.
 fn spawnNewWindow(self: *App) void {
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
@@ -6316,25 +6316,27 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
     }
 }
 
-const ScrollbackKeyAction = union(enum) {
+const KeyBindingAction = union(enum) {
     lines: isize,
     page_up,
     page_down,
     top,
     bottom,
+    new_window,
     passthrough,
 };
 
-fn scrollbackKeyAction(
+fn keyBindingAction(
     config: *const Config,
     active_screen: vt.ScreenSet.Key,
     event: vt.input.KeyEvent,
-) ?ScrollbackKeyAction {
+) ?KeyBindingAction {
     if (keybind.getEvent(config.keybinds.items, event)) |action| {
         // Explicit bindings override fixed shortcuts even when unbound or
         // passed through to an alternate-screen application.
         return switch (action) {
             .unbind => .passthrough,
+            .new_window => .new_window,
             .scroll_page_lines => |lines| if (active_screen == .primary) .{ .lines = lines } else .passthrough,
         };
     }
@@ -6351,8 +6353,8 @@ fn scrollbackKeyAction(
     };
 }
 
-fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: ScrollbackKeyAction) void {
-    std.debug.assert(scroll != .passthrough);
+fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: KeyBindingAction) void {
+    std.debug.assert(scroll != .passthrough and scroll != .new_window);
     // Consume the matching release too, but move only on press/repeat.
     if (event.action == .release) return;
 
@@ -6365,7 +6367,7 @@ fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: ScrollbackK
         .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
         .top => self.term.screens.active.pages.scroll(.top),
         .bottom => self.term.screens.active.pages.scroll(.active),
-        .passthrough => unreachable,
+        .new_window, .passthrough => unreachable,
     }
     self.revealScrollbar();
     self.needs_redraw = true;
@@ -6378,8 +6380,11 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     if (self.search != null) return self.handleSearchKey(event);
 
-    if (scrollbackKeyAction(&self.config, self.term.screens.active_key, event)) |scroll| {
-        if (scroll != .passthrough) return self.handleScrollbackKey(event, scroll);
+    if (keyBindingAction(&self.config, self.term.screens.active_key, event)) |bound| switch (bound) {
+        .passthrough => {},
+        // Consume the matching repeats and releases too, like fixed shortcuts.
+        .new_window => return if (action == .press) self.spawnNewWindow(),
+        else => return self.handleScrollbackKey(event, bound),
     } else if (!event.mods.alt and !event.mods.super) {
         // Fixed shortcuts fire once, but their matching repeats and releases
         // must not leak into the application as keyboard-protocol input.
@@ -6399,7 +6404,6 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
                 'c' => return if (action == .press) self.copyToClipboard(),
                 'f' => return if (action == .press) self.startSearch(),
                 'g' => return if (action == .press) self.pipeCommandOutput(),
-                'n' => return if (action == .press) self.spawnNewWindow(),
                 'v' => return if (action == .press) self.beginPaste(.clipboard),
                 'x' => return if (action == .press) self.jumpPrompt(1),
                 'z' => return if (action == .press) self.jumpPrompt(-1),
@@ -7668,45 +7672,45 @@ test "scrollback keys require supported modifiers on the primary screen" {
     const shifted: vt.input.KeyMods = .{ .shift = true };
     const ctrl_shifted: vt.input.KeyMods = .{ .shift = true, .ctrl = true };
     try std.testing.expectEqual(
-        ScrollbackKeyAction{ .lines = -1 },
-        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
+        KeyBindingAction{ .lines = -1 },
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction{ .lines = 1 },
-        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_down, .mods = shifted }).?,
+        KeyBindingAction{ .lines = 1 },
+        keyBindingAction(&config, .primary, .{ .key = .arrow_down, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction.page_up,
-        scrollbackKeyAction(&config, .primary, .{ .key = .page_up, .mods = shifted }).?,
+        KeyBindingAction.page_up,
+        keyBindingAction(&config, .primary, .{ .key = .page_up, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction.page_down,
-        scrollbackKeyAction(&config, .primary, .{ .key = .page_down, .mods = shifted }).?,
+        KeyBindingAction.page_down,
+        keyBindingAction(&config, .primary, .{ .key = .page_down, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction.top,
-        scrollbackKeyAction(&config, .primary, .{ .key = .home, .mods = shifted }).?,
+        KeyBindingAction.top,
+        keyBindingAction(&config, .primary, .{ .key = .home, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction.bottom,
-        scrollbackKeyAction(&config, .primary, .{ .key = .end, .mods = shifted }).?,
+        KeyBindingAction.bottom,
+        keyBindingAction(&config, .primary, .{ .key = .end, .mods = shifted }).?,
     );
 
     try std.testing.expectEqual(
-        ScrollbackKeyAction.passthrough,
-        scrollbackKeyAction(&config, .alternate, .{ .key = .arrow_up, .mods = shifted }).?,
+        KeyBindingAction.passthrough,
+        keyBindingAction(&config, .alternate, .{ .key = .arrow_up, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
         null,
-        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }),
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }),
     );
     try std.testing.expectEqual(
         null,
-        scrollbackKeyAction(&config, .primary, .{ .key = .page_up }),
+        keyBindingAction(&config, .primary, .{ .key = .page_up }),
     );
     try std.testing.expectEqual(
         null,
-        scrollbackKeyAction(&config, .primary, .{
+        keyBindingAction(&config, .primary, .{
             .key = .page_up,
             .mods = ctrl_shifted,
         }),
@@ -7715,12 +7719,12 @@ test "scrollback keys require supported modifiers on the primary screen" {
     try config.set(std.testing.allocator, "keybind", "ctrl+shift+up=scroll_page_lines:-5");
     try config.set(std.testing.allocator, "keybind", "shift+up=unbind");
     try std.testing.expectEqual(
-        ScrollbackKeyAction{ .lines = -5 },
-        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }).?,
+        KeyBindingAction{ .lines = -5 },
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction.passthrough,
-        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
+        KeyBindingAction.passthrough,
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
     );
 }
 
@@ -7737,12 +7741,30 @@ test "custom scrolling overrides fixed chords and passes through on the alternat
         for ([_]vt.input.KeyAction{ .press, .repeat, .release }) |action| {
             var event = case.event;
             event.action = action;
-            try std.testing.expectEqual(ScrollbackKeyAction{ .lines = -3 }, scrollbackKeyAction(&config, .primary, event).?);
-            try std.testing.expectEqual(ScrollbackKeyAction.passthrough, scrollbackKeyAction(&config, .alternate, event).?);
+            try std.testing.expectEqual(KeyBindingAction{ .lines = -3 }, keyBindingAction(&config, .primary, event).?);
+            try std.testing.expectEqual(KeyBindingAction.passthrough, keyBindingAction(&config, .alternate, event).?);
         }
     }
     try config.set(std.testing.allocator, "keybind", "ctrl+shift+c=unbind");
-    try std.testing.expectEqual(ScrollbackKeyAction.passthrough, scrollbackKeyAction(&config, .primary, cases[0].event).?);
+    try std.testing.expectEqual(KeyBindingAction.passthrough, keyBindingAction(&config, .primary, cases[0].event).?);
+}
+
+test "new_window defaults to ctrl+shift+n and can be rebound on either screen" {
+    var config: Config = .{};
+    defer config.keybinds.deinit(std.testing.allocator);
+    const ctrl_shift_n: vt.input.KeyEvent = .{ .key = .key_n, .utf8 = "N", .unshifted_codepoint = 'n', .mods = .{ .ctrl = true, .shift = true } };
+    const alt_n: vt.input.KeyEvent = .{ .key = .key_n, .utf8 = "n", .unshifted_codepoint = 'n', .mods = .{ .alt = true } };
+    for ([_]vt.ScreenSet.Key{ .primary, .alternate }) |screen| {
+        try std.testing.expectEqual(KeyBindingAction.new_window, keyBindingAction(&config, screen, ctrl_shift_n).?);
+    }
+    try std.testing.expectEqual(null, keyBindingAction(&config, .primary, alt_n));
+
+    try config.set(std.testing.allocator, "keybind", "alt+n=new_window");
+    try config.set(std.testing.allocator, "keybind", "ctrl+shift+n=unbind");
+    for ([_]vt.ScreenSet.Key{ .primary, .alternate }) |screen| {
+        try std.testing.expectEqual(KeyBindingAction.new_window, keyBindingAction(&config, screen, alt_n).?);
+        try std.testing.expectEqual(KeyBindingAction.passthrough, keyBindingAction(&config, screen, ctrl_shift_n).?);
+    }
 }
 
 test "scrollback search scrolls a history match into the viewport" {
